@@ -3,7 +3,6 @@ import re
 import sys
 import json
 import base64
-import shutil
 import tempfile
 import subprocess
 import gc
@@ -66,17 +65,11 @@ IMAGE_QUALITY = 85
 # 1.0 = 原尺寸；0.5 = 长宽各缩一半，像素数降到 1/4。
 # 模型处理图片的时间与像素数成正比，实测单轮请求
 # 由约 6.0 秒降到约 3.4 秒。
-# 注意：只影响发给模型的那张图。本地遮挡检查用的
-# debug_last.png 仍保存原尺寸，模型坐标会按同一比例
-# 换算回来，坐标清单也会按同一比例缩给模型，
+# 注意：只影响发给模型的那张图。本地遮挡检查用的分析图
+# 始终保留原尺寸（只存在内存里，不落盘），模型坐标会按
+# 同一比例换算回来，坐标清单也会按同一比例缩给模型，
 # 保证模型看到的数字和图片完全一致。
 MODEL_IMAGE_SCALE = 0.5
-
-# 是否保存坐标调试图
-# True 时会在项目目录生成：
-#   debug_last.png  —— 本轮的原尺寸分析图（同时也是发给模型的底图）
-#   debug_click.png —— 在截图上标出实际点击位置，用于核对坐标映射
-DEBUG_ENABLED = True
 
 # 是否只把游戏窗口区域发给模型（强烈建议开启）
 # 游戏窗口通常只占屏幕一小部分，全屏截图会让砖块太小，
@@ -87,11 +80,6 @@ CROP_TO_GAME_WINDOW = True
 GAME_WINDOW_KEYWORD = "羊了个羊"
 
 PROJECT_DIR = Path(__file__).resolve().parent
-DEBUG_LAST_PATH = PROJECT_DIR / "debug_last.png"
-DEBUG_CLICK_PATH = PROJECT_DIR / "debug_click.png"
-LEVEL_END_PATH = PROJECT_DIR / "level_end.png"
-LOG_PATH = PROJECT_DIR / "agent_log.txt"
-
 # ============================================================
 # 关卡结束自动停止
 # ============================================================
@@ -173,7 +161,7 @@ FORCED_END_MAX_PER_ROUND = 3
 # 正常情况下主动结束一次就会填满卡槽、弹出失败结算；
 # 连续等这么多轮还停在死局，说明点击根本没生效
 # （窗口被挪动 / 有未知遮挡 / 预算被耗尽），再等只是烧时间。
-# 按 ~4 秒/轮算，30 轮约 2 分钟。停机前轨迹会由退出兜底抢救保存。
+# 按 ~4 秒/轮算，30 轮约 2 分钟，之后程序自行停机并打印原因。
 STALL_STOP_ROUNDS = 30
 
 # ============================================================
@@ -239,7 +227,7 @@ LAST_TRAY_DANGER = set()
 # 只按中心做容差匹配会漏判，导致把危险砖当成安全砖放过去。
 LAST_CLICK_BBOX = []
 
-# 【DPO 格式改造】本轮候选清单快照（写入轨迹 JSON 的 candidates 字段）：
+# 本轮候选清单快照（每轮由 build_ranked_hint 刷新）：
 #   [{"analysis_xy": [ax, ay],   # 分析图（原尺寸）坐标
 #     "model_xy": [mx, my],      # 模型看到的缩放图坐标
 #     "group": 1/2/3,            # 1=立即三连 2=与卡槽凑对 3=全新图案
@@ -285,377 +273,33 @@ LAST_ANALYSIS_SIZE = None
 
 
 # ============================================================
-# 1.1 对局轨迹自动保存（离线 DPO / SFT 训练语料）
+# 1.1 本轮分析图（只保留在内存里，不落盘）
 # ============================================================
 #
-# 【DPO 格式改造】原来的轨迹只存 model_output / think / click / result /
-# tray_count，缺三样离线训练必需的东西：
-#   1) 每一步的截图  -> DPO 是多模态偏好数据，必须能还原"同一张图"
-#   2) 完整 prompt   -> 训练与推理必须用同一段提示词
-#   3) 候选清单快照  -> 才能对"同一张图 + 同一 prompt"构造
-#                       chosen（长期最优）/ rejected（贪心坏动作）
-# 现在每步额外记录：frame / prompt / candidates / tray_before / tray_after，
-# 顶层额外记录 system_prompt / schema_version / trace_id / stop_kind。
-#
-# 目录结构：
-#   traces/trace_YYYYmmdd_HHMMSS.json      一局一份轨迹
-#   traces/frames/<trace_id>/step_0001.jpg 每一步发给模型的原始帧
-TRACE_ENABLED = True
-TRACE_DIR = PROJECT_DIR / "traces"
-TRACE_FRAMES_DIRNAME = "frames"
-
-# 轨迹数据结构版本号：预处理脚本据此判断字段是否可用
-TRACE_SCHEMA_VERSION = 2
-
-# 本局轨迹 id（一局内所有帧共用一个目录）
-TRACE_ID = ""
-# 本局帧图目录
-TRACE_FRAMES_DIR = None
-# 本局所有步骤记录（每局开始时清空）
-TRACE_STEPS = []
-# 本局已记录到第几步
-TRACE_STEP_NO = 0
-
-# ---- 供 record_step 取用的"本轮快照"（每轮由 ask_ai 刷新）----
-# 本轮发给模型的完整 user 文本
-LAST_STEP_PROMPT = ""
-# 本轮候选清单快照（build_ranked_hint 生成）
-LAST_STEP_CANDIDATES = []
-# 本轮帧图在 traces/ 下的相对路径
-LAST_STEP_FRAME = None
-# 本轮图片尺寸（分析图 / 模型图）
-LAST_STEP_IMAGE_SIZE = None
-LAST_STEP_MODEL_IMAGE_SIZE = None
+# 截图之后，原尺寸的"分析图"要被好几个函数复用：
+#   - build_ranked_hint    找砖块、算消除分组
+#   - detect_level_end     判通关 / 失败
+#   - verify_click_on_face / check_priority_choice  遮挡与优先级校验
+# 所以它必须在整轮里保持可用。做法是在内存里留一份副本，
+# 不写任何文件 —— 程序退出后磁盘上不会留下任何截图。
+ANALYSIS_IMAGE = None
 
 
-def start_trace():
+def get_analysis_image():
     """
-    开始新一局：清空轨迹缓存并生成本局 trace_id 与帧目录。
+    返回本轮分析图的副本；还没截图或已被释放时返回 None。
+
+    返回副本是为了让调用方可以自由 close()，
+    不会把全局这份也关掉。
     """
 
-    global TRACE_STEPS
-    global TRACE_STEP_NO
-    global TRACE_ID
-    global TRACE_FRAMES_DIR
-
-    TRACE_STEPS = []
-    TRACE_STEP_NO = 0
-    TRACE_ID = time.strftime("%Y%m%d_%H%M%S")
-
-    if TRACE_ENABLED:
-        TRACE_FRAMES_DIR = (
-            TRACE_DIR / TRACE_FRAMES_DIRNAME / TRACE_ID
-        )
-        try:
-            TRACE_FRAMES_DIR.mkdir(parents=True, exist_ok=True)
-        except Exception as exc:
-            print(f"[警告] 创建帧目录失败：{exc}")
-            TRACE_FRAMES_DIR = None
-
-
-def save_step_frame(screenshot_path):
-    """
-    【DPO 格式改造】把本轮发给模型的临时截图复制到轨迹帧目录。
-
-    临时截图在每个请求结束后就被删除，所以必须在这里留档，
-    否则事后无法还原"当时的画面"，偏好数据也就无从构造。
-
-    返回：相对于 TRACE_DIR 的路径字符串（posix 风格）；
-          失败或未开启时返回 None。
-    """
-
-    if not TRACE_ENABLED or not screenshot_path:
-        return None
-
-    if TRACE_FRAMES_DIR is None:
+    if ANALYSIS_IMAGE is None:
         return None
 
     try:
-        temp_path = Path(screenshot_path)
-
-        if not temp_path.exists():
-            return None
-
-        TRACE_STEP_NO_PENDING = TRACE_STEP_NO + 1
-        target_name = f"step_{TRACE_STEP_NO_PENDING:04d}.jpg"
-        target_path = TRACE_FRAMES_DIR / target_name
-
-        shutil.copyfile(temp_path, target_path)
-
-        return (
-            Path(TRACE_FRAMES_DIRNAME)
-            / TRACE_ID
-            / target_name
-        ).as_posix()
-
-    except Exception as exc:
-        print(f"[警告] 保存轨迹帧失败：{exc}")
+        return ANALYSIS_IMAGE.copy()
+    except Exception:
         return None
-
-
-def record_step(
-    model_output,
-    think_text,
-    click_coord,
-    result,
-    tray_count,
-    attempt=1,
-    feedback=None,
-):
-    """
-    记录一局中的一步。
-
-    参数：
-        model_output：Qwen3-VL 本次输出的原始文本
-        think_text  ：从输出里正则提取出的"思考"内容
-        click_coord ：选择点击的坐标 [x, y]（分析图坐标）；
-                      wait / 未点击时为 None
-        result      ：操作结果（clicked / wait / blocked: 原因）
-        tray_count  ：该步决策时的卡槽占用格数
-        attempt     ：本轮是第几次询问模型（1 为首次）
-        feedback    ：本次询问是否带了"上一步被拒"的反馈
-
-    【DPO 格式改造】只有"首次询问且无反馈"的那一步才挂载
-    frame / prompt / candidates —— 重试轮的画面对应的是带纠正提示的
-    上下文，不能作为偏好数据里的"同一 prompt"样本。
-    """
-
-    global TRACE_STEP_NO
-    global LAST_STEP_PROMPT
-    global LAST_STEP_CANDIDATES
-    global LAST_STEP_FRAME
-    global LAST_STEP_IMAGE_SIZE
-    global LAST_STEP_MODEL_IMAGE_SIZE
-
-    if not TRACE_ENABLED:
-        return
-
-    TRACE_STEP_NO += 1
-
-    is_clean_step = attempt == 1 and not feedback
-
-    # 只有"真的点下去了"才有"点击后卡槽格数"，
-    # 等待/被拒的步沿用上一步的旧值会污染训练标签，这里显式置空
-    clicked_now = isinstance(result, str) and result.startswith(
-        "clicked"
-    )
-
-    step_record = {
-        "step": TRACE_STEP_NO,
-        "model_output": model_output,
-        "think": think_text,
-        "click": click_coord,
-        "result": result,
-        "tray_count": tray_count,
-        "tray_before": tray_count,
-        "tray_after": (
-            LAST_TRAY_AFTER_CLICK
-            if clicked_now and LAST_TRAY_AFTER_CLICK >= 0
-            else None
-        ),
-        "tray_capacity": TRAY_CAPACITY,
-        "attempt": attempt,
-        "feedback": feedback,
-    }
-
-    if is_clean_step:
-        step_record.update(
-            {
-                "frame": LAST_STEP_FRAME,
-                "image_size": LAST_STEP_IMAGE_SIZE,
-                "model_image_size": LAST_STEP_MODEL_IMAGE_SIZE,
-                "prompt": LAST_STEP_PROMPT,
-                "candidates": LAST_STEP_CANDIDATES,
-            }
-        )
-    else:
-        step_record.update(
-            {
-                "frame": None,
-                "image_size": None,
-                "model_image_size": None,
-                "prompt": None,
-                "candidates": None,
-            }
-        )
-
-    TRACE_STEPS.append(step_record)
-
-    # 快照用完即清，避免下一步误用上一帧的数据
-    LAST_STEP_PROMPT = ""
-    LAST_STEP_CANDIDATES = []
-    LAST_STEP_FRAME = None
-
-
-def save_trace(cleared, fail_reason, stop_kind=None):
-    """
-    把本局完整轨迹写成 JSON 文件（离线训练语料）。
-
-    返回写出的文件路径；失败或未开启时返回 None。
-    """
-
-    if not TRACE_ENABLED:
-        return None
-
-    try:
-        TRACE_DIR.mkdir(parents=True, exist_ok=True)
-
-        trace_id = TRACE_ID or time.strftime("%Y%m%d_%H%M%S")
-        path = TRACE_DIR / f"trace_{trace_id}.json"
-
-        # 【DPO 格式改造】顶层补齐训练侧必需字段：
-        #   system_prompt  -> 训练时用完全相同的系统提示词
-        #   schema_version -> 预处理脚本据此校验字段完整性
-        #   frames_dir     -> 帧图目录（相对 traces/）
-        #   stop_kind      -> cleared / failed / covered ...
-        payload = {
-            "schema_version": TRACE_SCHEMA_VERSION,
-            "trace_id": trace_id,
-            "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "model": MODEL,
-            "system_prompt": SYSTEM_PROMPT,
-            "infer_params": {
-                "temperature": MODEL_TEMPERATURE,
-                "top_p": MODEL_TOP_P,
-                "max_tokens": MODEL_MAX_TOKENS,
-            },
-            "tray_capacity": TRAY_CAPACITY,
-            "image_scale": MODEL_IMAGE_SCALE,
-            "frames_dir": (
-                f"{TRACE_FRAMES_DIRNAME}/{trace_id}"
-            ),
-            "stop_kind": stop_kind,
-            "total_steps": len(TRACE_STEPS),
-            "cleared": bool(cleared),
-            "fail_reason": fail_reason,
-            "steps": TRACE_STEPS,
-        }
-
-        with open(path, "w", encoding="utf-8") as trace_file:
-            json.dump(payload, trace_file, ensure_ascii=False, indent=2)
-
-        print(f"[轨迹] 本局轨迹已保存：{path}")
-        return path
-
-    except Exception as exc:
-        print(f"[警告] 保存对局轨迹失败：{exc}")
-        return None
-
-
-def reset_game_context():
-    """
-    【修改点·需求5】一局结束后清空对话上下文与轨迹缓存。
-
-    说明：ask_ai 每次请求都新建 messages 列表、不携带任何历史消息，
-    所以"对话上下文"本身不会跨轮累积；这里再把轨迹缓存释放掉，
-    保证多局串行采样时内存不会持续上涨。
-    """
-
-    global TRACE_STEPS
-    global TRACE_STEP_NO
-    global TRACE_ID
-    global TRACE_FRAMES_DIR
-    global LAST_STEP_PROMPT
-    global LAST_STEP_CANDIDATES
-    global LAST_STEP_FRAME
-    global LAST_STEP_IMAGE_SIZE
-    global LAST_STEP_MODEL_IMAGE_SIZE
-
-    TRACE_STEPS = []
-    TRACE_STEP_NO = 0
-    TRACE_ID = ""
-    TRACE_FRAMES_DIR = None
-    LAST_STEP_PROMPT = ""
-    LAST_STEP_CANDIDATES = []
-    LAST_STEP_FRAME = None
-    LAST_STEP_IMAGE_SIZE = None
-    LAST_STEP_MODEL_IMAGE_SIZE = None
-
-    gc.collect()
-
-
-# ============================================================
-# 1.2 退出兜底：抢救"被中断的那一局"
-# ============================================================
-#
-# 轨迹 JSON 只在 finish_level() 里落盘，于是采集期有个漏洞：
-# 按 Ctrl+C 收工 / 崩溃 / 鼠标撞左上角触发安全机制时，main 直接跳出循环，
-# 当前这一局的 JSON 不会写出 —— 但每一步的帧图早就复制进
-# traces/frames/<trace_id>/ 了，结果是"有图没 JSON"的孤儿帧，
-# trace_to_dataset 会整份跳过，整局采集白费。
-#
-# 所以 main 退出前统一收尾：
-#   - 本局有完整步   -> 按"被中断"落盘一份可用轨迹（stop_kind=interrupted）
-#   - 本局一步都没有 -> 只剩一个空帧目录，清掉它别留垃圾
-#
-# 注意：interrupted 局 cleared=False，SFT 默认不吃（要加
-# --include-uncleared-sft），但 DPO 不要求通关，照样能用。
-INTERRUPT_TRACE_REASON = "采集被中断（Ctrl+C / 异常退出），本局未打完"
-INTERRUPT_STOP_KIND = "interrupted"
-
-
-def cleanup_unsaved_frame_dir():
-    """
-    清理本局留下的、没有任何可用步的帧目录。
-
-    只删"完全空的"目录；里面还有帧时就**不删**，只打印提示：
-    帧是先复制、后记录的，极端情况下会剩下一两张配不上模型输出的帧，
-    宁可留着交给人工判断，也不替用户丢数据。
-    """
-
-    if TRACE_FRAMES_DIR is None or not TRACE_FRAMES_DIR.exists():
-        return
-
-    try:
-        leftovers = sorted(TRACE_FRAMES_DIR.iterdir())
-
-        if not leftovers:
-            TRACE_FRAMES_DIR.rmdir()
-            print(f"[轨迹] 已清理空帧目录：{TRACE_FRAMES_DIR}")
-            return
-
-        print(
-            f"[轨迹] 本局没有可训练步，保留帧目录"
-            f"（{len(leftovers)} 张未入集帧）：{TRACE_FRAMES_DIR}"
-        )
-
-    except Exception as exc:
-        print(f"[警告] 清理帧目录失败：{exc}")
-
-
-def finalize_interrupted_episode():
-    """
-    退出前的收尾兜底：把当前局的轨迹抢救下来，别让整局采集白费。
-
-    任何退出路径都可以安全重复调用（atexit 里也挂了它）：
-    正常打完的局已经在 finish_level 里存过并 reset 过，这里会因为
-    TRACE_STEPS 为空而直接空转，不会写出第二份同名 JSON。
-
-    返回 True 表示确实抢救了一局，False 表示没有可抢救的内容。
-    """
-
-    if not TRACE_STEPS:
-        cleanup_unsaved_frame_dir()
-        return False
-
-    step_count = len(TRACE_STEPS)
-
-    print(
-        f"\n[轨迹] 本局未正常结束（已记录 {step_count} 步），"
-        "退出前先抢救保存"
-    )
-    append_log(f"轨迹 | 中途退出，抢救保存本局 {step_count} 步")
-
-    path = save_trace(
-        cleared=False,
-        fail_reason=INTERRUPT_TRACE_REASON,
-        stop_kind=INTERRUPT_STOP_KIND,
-    )
-
-    # 存完即清空：保证重复调用（main 收尾 + atexit）不会重复落盘
-    reset_game_context()
-
-    return path is not None
 
 
 # ============================================================
@@ -771,6 +415,7 @@ def capture_screen():
     from PIL import Image as PILImage
 
     global LAST_WINDOW_RECT
+    global ANALYSIS_IMAGE
 
     screenshot = None
     rgb_screenshot = None
@@ -877,12 +522,14 @@ def capture_screen():
             if model_image is not rgb_screenshot:
                 model_image.close()
 
-        # 6. 保存一份本轮分析图
+        # 6. 留一份本轮分析图给后续分析用
         #    （遮挡检查的数据源，必须保持原尺寸，不能缩放）
-        try:
-            rgb_screenshot.save(DEBUG_LAST_PATH, format="PNG")
-        except Exception as exc:
-            print(f"[警告] 保存分析图失败：{exc}")
+        #    只存在内存里，不写任何文件
+        global ANALYSIS_IMAGE
+        previous_image = ANALYSIS_IMAGE
+        ANALYSIS_IMAGE = rgb_screenshot.copy()
+        if previous_image is not None:
+            previous_image.close()
 
         return screenshot_path, image_width, image_height
 
@@ -952,13 +599,6 @@ def ask_ai(feedback=None):
         image_height: 本轮截图高度
     """
 
-    # 【DPO 格式改造】本轮留档用到的全局变量
-    global LAST_STEP_PROMPT
-    global LAST_STEP_CANDIDATES
-    global LAST_STEP_FRAME
-    global LAST_STEP_IMAGE_SIZE
-    global LAST_STEP_MODEL_IMAGE_SIZE
-
     screenshot_path = None
     image_base64 = None
 
@@ -1026,19 +666,6 @@ def ask_ai(feedback=None):
 
         print("[AI] 正在分析本轮最新截图……")
 
-        # 【DPO 格式改造】只有"首次询问（不带反馈）"的那一轮才留档
-        # frame / prompt / candidates：重试轮的画面对应的是带纠正说明的
-        # 上下文，不能当作偏好数据里的"同一 prompt"样本。
-        if feedback is None:
-            LAST_STEP_PROMPT = user_text
-            LAST_STEP_CANDIDATES = list(LAST_CANDIDATES)
-            LAST_STEP_IMAGE_SIZE = [image_width, image_height]
-            LAST_STEP_MODEL_IMAGE_SIZE = [
-                round(image_width * MODEL_IMAGE_SCALE),
-                round(image_height * MODEL_IMAGE_SCALE),
-            ]
-            LAST_STEP_FRAME = save_step_frame(screenshot_path)
-
         # 每次使用独立的消息列表，不携带旧截图或历史消息
         # 【修改点·需求5】对话上下文按"每次请求独立"处理，
         # 不跨轮、不跨局累积，避免内存持续上涨
@@ -1087,9 +714,6 @@ def ask_ai(feedback=None):
             print(
                 "[警告] 模型输出被长度上限截断（finish_reason=length），"
                 "坐标行可能缺失，将按输出格式错误重问"
-            )
-            append_log(
-                "截断 | finish_reason=length | 坐标行可能缺失"
             )
 
         return model_text, image_width, image_height
@@ -1482,10 +1106,9 @@ def non_eliminate_survivable(tray_used, tray_n, board_n):
 
     实测教训（trace_20261014_110737 第 79 步）：
     旧实现把凑对当成"点下去立即三连"直接放行（return True），
-    结果卡槽 6/7 时 5 块凑对被标成 safe=True 写进提示和轨迹，
+    结果卡槽 6/7 时 5 块凑对被标成 safe=True 放进了提示清单，
     模型一点就 7/7 当场失败。这是规则错误，不是策略偏好：
-    任何策略下这一步都必死，而且错误的 safe 标签还会
-    顺着 DPO 数据集污染训练样本。
+    任何策略下这一步都必死。
 
     参数 board_n 仅为保持旧签名兼容，不参与判定
     （"可见副本数"在叠放关卡里不可靠：同款大半压在下面，
@@ -1985,11 +1608,11 @@ def build_candidates_snapshot(
     scale_point,
 ):
     """
-    【DPO 格式改造】生成本轮候选清单快照并写入全局 LAST_CANDIDATES。
+    生成本轮候选清单快照并写入全局 LAST_CANDIDATES。
 
-    这些字段是离线构造偏好数据的基础：只有知道"同一张图上有哪些
-    可选动作、各自的长短期收益与风险"，才能确定性地构造
-    chosen（长期最优）/ rejected（贪心坏动作）。
+    这份快照是本地闸门共用的判据来源：只有知道"同一张图上有哪些
+    可选动作、各自被压住多少下层砖、会不会把卡槽推入必败状态"，
+    后面 force_end_round() 之类的兜底逻辑才能确定性地挑一块砖出来。
 
     参数：
         groups           ：((组号, 候选列表, 点击类型), ...)；
@@ -2106,15 +1729,9 @@ def build_ranked_hint(image_width, image_height):
     if not CLICKABLE_HINT_ENABLED:
         return None
 
-    if not DEBUG_LAST_PATH.exists():
-        return None
+    image = get_analysis_image()
 
-    try:
-        from PIL import Image as PILImage
-
-        image = PILImage.open(DEBUG_LAST_PATH)
-        image = image.convert("RGB")
-    except Exception:
+    if image is None:
         return None
 
     if image.size != (image_width, image_height):
@@ -2200,9 +1817,8 @@ def build_ranked_hint(image_width, image_height):
     group2 = []   # 卡槽已有 1 个同款，点击凑成一对
     group3 = []   # 全新图案，占用卡槽空位
 
-    # 【DPO 格式改造】center -> (图案标签, 卡槽同款数, 棋盘同款数)
-    # 用于事后把"每块候选砖的图案与同款数"写进轨迹 JSON，
-    # 让数据集脚本能在离线状态下重建 chosen/rejected 的判据
+    # center -> (图案标签, 卡槽同款数, 棋盘同款数)
+    # 用来算"这块砖点下去会不会把卡槽推入必败状态"
     tile_pattern_meta = {}
 
     for tile, label in zip(board_tiles, board_labels):
@@ -2276,7 +1892,7 @@ def build_ranked_hint(image_width, image_height):
         for tile in board_tiles
     ]
 
-    # ---------- 【DPO 格式改造】候选清单快照 ----------
+    # ---------- 候选清单快照 ----------
     # 位置说明：必须在 scale_point 定义之后调用（它要用来换算模型坐标）。
 
     # 原尺寸分析图坐标 -> 模型看到的缩放图坐标
@@ -2292,8 +1908,8 @@ def build_ranked_hint(image_width, image_height):
         )
 
     # 把这一轮所有候选砖的完整判据写进 LAST_CANDIDATES，
-    # 由 ask_ai 复制进轨迹 JSON。离线数据集脚本据此对
-    # "同一张图 + 同一 prompt"构造 chosen / rejected：
+    # 供 force_end_round()（主动结束本局）挑选要点的砖 —— 它只从
+    # safe=False 的那批里挑，因为那些都是"点了会把卡槽推入必败"的砖：
     #   group=1 点下即三连（短期收益最高）
     #   group=2 与卡槽凑成一对（离三连差一块）
     #   group=3 全新图案（会占卡槽空位）
@@ -2505,12 +2121,6 @@ def build_ranked_hint(image_width, image_height):
     )
 
     # 每轮把分组情况写进日志，方便回查分组是否合理
-    append_log(
-        f"分析 | 卡槽 {len(tray_tiles)}/{TRAY_CAPACITY}"
-        f" | 1组 {len(group1)}"
-        f" | 2组 {len(group2)}"
-        f" | 3组 {len(group3)}"
-    )
 
     # 记录最高优先级组（原尺寸坐标），供本地强制校验使用
     # LAST_PRIORITY_ORDER 保留本地排序，供"本地兜底"按序挑选
@@ -2579,15 +2189,9 @@ def detect_level_end(image_width, image_height):
     global LAST_STABLE_BOARD
     global LAST_SAW_GAMEPLAY
 
-    if not DEBUG_LAST_PATH.exists():
-        return None, ""
+    image = get_analysis_image()
 
-    try:
-        from PIL import Image as PILImage
-
-        image = PILImage.open(DEBUG_LAST_PATH)
-        image = image.convert("RGB")
-    except Exception:
+    if image is None:
         return None, ""
 
     try:
@@ -2735,10 +2339,6 @@ def force_end_round():
         f"（第 {LAST_FORCED_END_COUNT}/{FORCED_END_MAX_PER_ROUND} 次）"
     )
 
-    append_log(
-        f"主动结束 | 无安全走法且禁用道具，点击({ax}, {ay})结束本局"
-        f"（第 {LAST_FORCED_END_COUNT} 次）"
-    )
 
     screen_x, screen_y = screenshot_to_screen(
         ax, ay, image_width, image_height
@@ -2749,18 +2349,6 @@ def force_end_round():
     # 这一击必然把卡槽填满（候选全是"新图案"），
     # 记下来供失败归因使用（证据 1：点击后卡槽 >= 7 → failed）
     LAST_TRAY_AFTER_CLICK = TRAY_CAPACITY
-
-    # 记入轨迹，但用 feedback 标记为"主动结束"，
-    # 数据集构建时不会把它当成模型的可训练决策帧
-    record_step(
-        "(主动结束本局)",
-        "卡槽只剩 1 个空位且无安全走法，禁止使用道具，主动点砖结束本局",
-        [ax, ay],
-        "forced_end: 主动结束本局，等待失败结算",
-        LAST_TRAY_COUNT,
-        attempt=RECLICK_ATTEMPTS + 1,
-        feedback="forced_end",
-    )
 
     return True
 
@@ -2834,49 +2422,9 @@ def finish_level(kind, description):
     else:
         print("结论：画面被弹窗覆盖，本局已结束（归因证据不足）")
 
-    try:
-        if DEBUG_LAST_PATH.exists():
-            LEVEL_END_PATH.write_bytes(DEBUG_LAST_PATH.read_bytes())
-            print(f"结束画面已保存：{LEVEL_END_PATH}")
-    except Exception as exc:
-        print(f"[警告] 保存结束画面失败：{exc}")
-
-    append_log(f"结束 | 判定={kind} | {description}")
-
-    # 【修改点·需求3】本局结束（通关/卡死）：
-    # 判定是否通关并输出完整轨迹 JSON，供后续 DPO 样本采集。
     # 【通关/失败归因】只有 kind == "cleared" 才算通关；
-    # failed / stuck / covered 一律按失败记录，并写入具体原因。
-    cleared = kind == "cleared"
-
-    fail_reason = "" if cleared else description
-
-    print(
-        f"本局结果：{'通关' if cleared else '未通关'}"
-        f" | 写入轨迹：total_steps={len(TRACE_STEPS)}"
-    )
-
-    # 【防误判配套】一步都没记录的局（开局残留弹窗 / 重开加载过渡
-    # 被判 covered 的"幽灵局"）没有训练价值，跳过落盘，
-    # 避免数据集构建时出现一堆"没有任何可训练步"的坏轨迹。
-    if not TRACE_STEPS:
-        print(
-            "[轨迹] 本局没有任何可训练步（幽灵局），跳过保存轨迹 JSON"
-        )
-        append_log("轨迹 | 本局 0 步，跳过保存")
-        # 顺带清掉这次 start_trace 建出来的空帧目录，
-        # 否则每遇到一次"幽灵局"就多留一个空目录
-        cleanup_unsaved_frame_dir()
-    else:
-        save_trace(
-            cleared=cleared,
-            fail_reason=fail_reason,
-            stop_kind=kind,
-        )
-
-    # 【修改点·需求5】本局结束，清空对话上下文 / 轨迹缓存，
-    # 避免多局串行采样时内存持续上涨
-    reset_game_context()
+    # failed / covered 等一律按未通关输出
+    print(f"本局结果：{'通关' if kind == 'cleared' else '未通关'}")
 
     # 归因状态清零（下一局重新累积"是否见过正常对局画面"的证据，
     # 否则上一局的痕迹会让新一局的加载过渡期被误判通关/失败）
@@ -3104,15 +2652,9 @@ def pick_local_fallback():
     if not LAST_PRIORITY_ORDER:
         return None
 
-    if not DEBUG_LAST_PATH.exists():
-        return None
+    image = get_analysis_image()
 
-    try:
-        from PIL import Image as PILImage
-
-        image = PILImage.open(DEBUG_LAST_PATH)
-        image = image.convert("RGB")
-    except Exception:
+    if image is None:
         return None
 
     try:
@@ -3240,17 +2782,10 @@ def verify_click_on_face(x, y, image_width, image_height):
     if not CHECK_OCCLUSION:
         return True, ""
 
-    if not DEBUG_LAST_PATH.exists():
+    image = get_analysis_image()
+
+    if image is None:
         print("[警告] 找不到本轮分析图，跳过遮挡检查")
-        return True, ""
-
-    try:
-        from PIL import Image as PILImage
-
-        image = PILImage.open(DEBUG_LAST_PATH)
-        image = image.convert("RGB")
-    except Exception as exc:
-        print(f"[警告] 读取分析图失败，跳过遮挡检查：{exc}")
         return True, ""
 
     if image.size != (image_width, image_height):
@@ -3358,84 +2893,6 @@ def screenshot_to_screen(x, y, screenshot_width, screenshot_height):
     return screen_x, screen_y
 
 
-def save_debug_marker(screen_x, screen_y):
-    """
-    在调试图上标出实际点击位置，方便人工核对。
-
-    调试图是发给模型的裁剪截图（或全屏截图），
-    需要把鼠标逻辑坐标换算回调试图的像素坐标再标注。
-    """
-
-    if not DEBUG_LAST_PATH.exists():
-        return
-
-    try:
-        from PIL import Image, ImageDraw
-
-        with Image.open(DEBUG_LAST_PATH) as raw:
-            image = raw.convert("RGB")
-
-        if LAST_WINDOW_RECT is not None:
-            win_left, win_top, win_width, win_height = LAST_WINDOW_RECT
-
-            pixel_x = (screen_x - win_left) * image.width / win_width
-            pixel_y = (screen_y - win_top) * image.height / win_height
-
-        else:
-            screen_width, screen_height = pyautogui.size()
-
-            pixel_x = screen_x * image.width / screen_width
-            pixel_y = screen_y * image.height / screen_height
-
-        draw = ImageDraw.Draw(image)
-        radius = 40
-
-        draw.line(
-            (pixel_x - radius, pixel_y, pixel_x + radius, pixel_y),
-            fill=(255, 0, 0),
-            width=6,
-        )
-        draw.line(
-            (pixel_x, pixel_y - radius, pixel_x, pixel_y + radius),
-            fill=(255, 0, 0),
-            width=6,
-        )
-        draw.ellipse(
-            (
-                pixel_x - radius,
-                pixel_y - radius,
-                pixel_x + radius,
-                pixel_y + radius,
-            ),
-            outline=(255, 0, 0),
-            width=6,
-        )
-
-        image.save(DEBUG_CLICK_PATH, format="PNG")
-        image.close()
-
-        print(f"[调试] 点击位置标记图已保存：{DEBUG_CLICK_PATH}")
-
-    except Exception as exc:
-        print(f"[警告] 生成坐标标记图失败：{exc}")
-
-def append_log(text):
-    """
-    把一轮的关键信息追加到日志文件，方便事后排查。
-
-    时间戳带日期（YYYY-MM-DD HH:MM:SS）：日志是跨天追加的同一份文件，
-    只写时分秒的话，几天的采集记录混在一起根本对不上是哪天，
-    事后想把某一局的时间点和 traces/ 里的轨迹对齐就无从下手。
-    """
-    try:
-        with open(LOG_PATH, "a", encoding="utf-8") as log_file:
-            log_file.write(
-                f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {text}\n"
-            )
-    except Exception:
-        pass
-
-
 # ============================================================
 # 11. 执行点击
 # ============================================================
@@ -3481,11 +2938,6 @@ def execute_action(data, image_width, image_height):
 
     if not valid:
         print(f"[安全] 本轮操作无效：{invalid_reason}")
-        append_log(
-            f"跳过 | action={action}"
-            f" | 模型({data.get('x')}, {data.get('y')})"
-            f" | {invalid_reason}"
-        )
         time.sleep(1)
         return "blocked", invalid_reason
 
@@ -3501,7 +2953,6 @@ def execute_action(data, image_width, image_height):
             "本程序禁止使用道具，请改选棋盘上的砖块坐标"
         )
         print(f"[道具禁用] 拒绝点击：{reason}")
-        append_log(f"跳过(道具) | 模型({x}, {y}) | {reason}")
         time.sleep(1)
         return "blocked", reason
 
@@ -3512,9 +2963,6 @@ def execute_action(data, image_width, image_height):
 
     if not clickable:
         print(f"[安全] 目标不可点击：{block_reason}")
-        append_log(
-            f"跳过(遮挡) | 模型({x}, {y}) | {block_reason}"
-        )
         time.sleep(1)
         return "blocked", block_reason
 
@@ -3524,10 +2972,6 @@ def execute_action(data, image_width, image_height):
 
     if not allowed:
         print(f"[优先级] 拒绝：{priority_reason}")
-        append_log(
-            f"跳过(优先级) | 模型({x}, {y})"
-            f" | {priority_reason}"
-        )
         time.sleep(1)
         return "blocked", priority_reason
 
@@ -3538,16 +2982,6 @@ def execute_action(data, image_width, image_height):
     print(f"[自动操作] 截图坐标：({x}, {y})")
     print(f"[自动操作] 鼠标坐标：({screen_x}, {screen_y})")
 
-    append_log(
-        f"点击 | 模型({x}, {y})"
-        f" -> 鼠标({screen_x}, {screen_y})"
-        f" | tile={data.get('tile')}"
-        f" | conf={data.get('confidence')}"
-    )
-
-    # 在调试图上标出实际点击位置
-    if DEBUG_ENABLED:
-        save_debug_marker(screen_x, screen_y)
 
     pyautogui.click(x=screen_x, y=screen_y)
 
@@ -3577,10 +3011,6 @@ def execute_action(data, image_width, image_height):
             "且未凑成三连，本关即将失败"
         )
 
-        append_log(
-            f"槽位危险 | 点击后卡槽 {LAST_TRAY_AFTER_CLICK}"
-            f"/{TRAY_CAPACITY} 且无三连，本关即将失败"
-        )
 
     print("[自动操作] 点击完成")
 
@@ -3601,10 +3031,11 @@ def execute_action(data, image_width, image_height):
 #
 # 之前出现过多个 Agent 进程同时运行的事故：每个进程都在截图、
 # 都在点击、都在判断弹窗，互相把对方的点击点到错误的界面上
-# （甚至点出调试菜单），轨迹数据也全部作废。
+# （甚至点出调试菜单），几个进程的点击会互相打断、结果全部作废。
 # 用锁文件 + PID 存活检查保证全局只有一个实例。
+# 锁文件放在系统临时目录，不往项目目录里写东西；进程正常退出时删除。
 
-AGENT_LOCK_PATH = PROJECT_DIR / "agent.lock"
+AGENT_LOCK_PATH = Path(tempfile.gettempdir()) / "game_agent.lock"
 
 
 def acquire_single_instance_lock():
@@ -3678,7 +3109,6 @@ def run_restart_script(end_kind=""):
     if not script_path.exists():
         reason = f"找不到重开脚本 {script_path}，无法自动开启下一局"
         print(f"\n[重开] {reason}")
-        append_log(f"重开 | {reason}")
         return False, reason
 
     cmd = [sys.executable, str(script_path)]
@@ -3690,7 +3120,6 @@ def run_restart_script(end_kind=""):
         f"\n[重开] 本局已结束（判定={end_kind or '未知'}），"
         f"交给独立脚本处理：{RESTART_SCRIPT_NAME}"
     )
-    append_log(f"重开 | 调用 {RESTART_SCRIPT_NAME}（判定={end_kind or '未知'}）")
 
     try:
         result = subprocess.run(cmd, cwd=str(PROJECT_DIR))
@@ -3699,12 +3128,10 @@ def run_restart_script(end_kind=""):
     except Exception as exc:
         reason = f"启动重开脚本失败：{type(exc).__name__}: {exc}"
         print(f"\n[重开] {reason}")
-        append_log(f"重开 | {reason}")
         return False, reason
 
     if result.returncode == 0:
         print(f"\n[重开] {RESTART_SCRIPT_NAME} 已开启新一局")
-        append_log("重开 | 成功，新一局已开启")
         return True, ""
 
     if result.returncode == RESTART_EXIT_CANNOT_ADVANCE:
@@ -3719,7 +3146,6 @@ def run_restart_script(end_kind=""):
         )
 
     print(f"\n[重开] {reason}")
-    append_log(f"重开 | 失败：{reason}")
 
     return False, reason
 
@@ -3728,13 +3154,12 @@ def main():
     print("=" * 55)
     print("微信小游戏 GUI Agent")
     print("模式：全自动（单模型 Qwen3-VL：看图 + 推理）")
-    print("截图：每轮截取游戏窗口区域")
+    print("截图：每轮截取游戏窗口区域（用完即删，不落盘）")
     print("输出：思考 + 点击坐标（正则解析）")
-    print("清理：每轮请求后删除临时截图")
+    print("产物：不在本地留下任何数据（截图 / 日志 / 轨迹全部不落盘）")
     print("职责：只负责玩游戏；本局结束后自动调用重开脚本")
     print(f"      重开脚本：{RESTART_SCRIPT_NAME}")
     print("      找按钮 / 问模型 / 验证新局都是它的事")
-    print("轨迹：每局结束自动保存 JSON（DPO 样本）")
     print("=" * 55)
 
     # 【单实例】拿到锁才允许开跑，防止多进程互相干扰
@@ -3750,10 +3175,6 @@ def main():
 
     import atexit
 
-    # 【收尾兜底】再挂一道保险：即使 main 是被异常/提前 return 带走的、
-    # 走不到循环后面那句 finalize，退出时也会补一次。
-    # atexit 是 LIFO，所以它会先于锁释放执行。
-    atexit.register(finalize_interrupted_episode)
     atexit.register(release_single_instance_lock)
 
     print("\n请确认：")
@@ -3767,13 +3188,11 @@ def main():
 
     round_number = 0
 
-    # 【修改点·需求3】开始本局：初始化对局轨迹
-    start_trace()
 
     # 【修改点·需求5】运行约束：
-    # 本程序单线程串行运行，一个进程只采样一局，不做并行多局采样；
-    # 每局结束后由 finish_level() 清空对话上下文与轨迹缓存，
-    # 因此不存在多局并发或跨局长跑导致的内存上涨。
+    # 本程序单线程串行运行；ask_ai 每轮都新建 messages 列表、
+    # 不携带任何历史消息，所以对话上下文不会跨轮累积，
+    # 多局连跑也不会因为上下文变长导致内存上涨。
 
     # 连续判定"本关已结束"的轮数，用于过滤动画等瞬时状态
     end_confirm_rounds = 0
@@ -3900,7 +3319,6 @@ def main():
                             "需要人工处理）"
                         )
                         print(f"\n[停止] {stop_reason}")
-                        append_log(f"停止 | {stop_reason}")
                         stop_requested = True
                         status = "wait"
                         break
@@ -3951,7 +3369,7 @@ def main():
                             f"卡槽 {LAST_TRAY_COUNT}/"
                             f"{TRAY_CAPACITY} 将满且无安全点击，"
                             f"{why}，已连续空等 {wait_rounds} 轮，"
-                            "熔断停机（本局轨迹由退出兜底抢救保存）"
+                            "熔断停机"
                         )
                         # 打印与记日志交给下方 stop_requested 统一处理
                         stop_requested = True
@@ -3966,11 +3384,6 @@ def main():
                             "当前画面没有可点击的砖块，"
                             "持续等待（下一轮仍会检测结算弹窗），"
                             f"已连续等待 {wait_rounds} 轮"
-                        )
-                        append_log(
-                            f"等待 | 卡槽 {LAST_TRAY_COUNT}/"
-                            f"{TRAY_CAPACITY} 无安全点击，"
-                            f"持续等待（第 {wait_rounds} 轮）"
                         )
 
                     time.sleep(1.5)
@@ -3998,20 +3411,6 @@ def main():
                     )
 
                     print(f"\n[格式] {reason}")
-                    append_log(f"跳过(格式) | {reason}")
-
-                    # 【修改点·需求3】记录这一步（格式错误也要入库）
-                    # 【DPO 格式改造】带上 attempt / feedback，
-                    # 只有首次无反馈的那一步才挂 frame+prompt+candidates
-                    record_step(
-                        model_text,
-                        "",
-                        None,
-                        f"blocked: {reason}",
-                        LAST_TRAY_COUNT,
-                        attempt=attempt + 1,
-                        feedback=feedback,
-                    )
                 else:
                     # 4.1 模型坐标是缩放图上的像素，换算回原尺寸
                     #     分析图坐标系，后续遮挡检查和鼠标换算都基于它
@@ -4024,23 +3423,6 @@ def main():
                         image_height,
                     )
 
-                    # 【修改点·需求3】记录这一步：
-                    # 步号 / 模型原始输出 / 思考 / 点击坐标 / 结果 / 卡槽占用
-                    if data.get("action") == "click":
-                        step_click = [data.get("x"), data.get("y")]
-                    else:
-                        step_click = None
-
-                    record_step(
-                        model_text,
-                        str(data.get("reason") or ""),
-                        step_click,
-                        f"{status}: {reason}" if reason else status,
-                        LAST_TRAY_COUNT,
-                        attempt=attempt + 1,
-                        feedback=feedback,
-                    )
-
                 if status != "blocked":
                     break
 
@@ -4050,7 +3432,6 @@ def main():
                         "[等待] 画面中没有检测到可点击的完整卡面，"
                         "2 秒后重新截图"
                     )
-                    append_log("等待 | 画面中无可点击卡面")
                     time.sleep(2)
                     break
 
@@ -4068,7 +3449,6 @@ def main():
                 # 求助多次仍读不到砖块"）优先展示，不做推进尝试
                 if stop_reason:
                     print(f"\n[停止] {stop_reason}")
-                    append_log(f"停止 | {stop_reason}")
                     break
 
                 # 【自动推进】failed（失败结算页）/ cleared（通关）/
@@ -4094,21 +3474,13 @@ def main():
                         unknown_rounds = 0
                         unknown_asks = 0
 
-                        # 上一局轨迹已在 finish_level 里保存并清空，
-                        # 这里为新一局重新初始化轨迹缓存
-                        start_trace()
-
                         print(
                             f"\n[自动推进] 已开始第 {episode_count} 局"
                             f"（已完成 {episode_count - 1} 局）"
                         )
-                        append_log(
-                            f"推进 | 成功，开始第 {episode_count} 局"
-                        )
                         continue
 
                     print(f"\n[停止] {restart_reason}")
-                    append_log(f"停止 | {restart_reason}")
                     break
 
                 print(
@@ -4138,10 +3510,6 @@ def main():
                         f"({fx}, {fy})"
                     )
 
-                    append_log(
-                        f"兜底点击 | 本地选择({fx}, {fy})"
-                        f" | 模型连续不配合"
-                    )
 
                     fallback_data = {
                         "action": "click",
@@ -4158,19 +3526,6 @@ def main():
                         image_height,
                     )
 
-                    # 【修改点·需求3】兜底动作也记入轨迹
-                    # 【DPO 格式改造】attempt 传 RECLICK_ATTEMPTS+1 且
-                    # feedback 非空，标明这不是"无反馈首轮"样本，
-                    # 因此不挂 frame/prompt/candidates（兜底帧可能已过期）
-                    record_step(
-                        "(本地兜底)",
-                        "本地兜底：模型连续未给出可执行动作",
-                        [fx, fy],
-                        f"{status}: {reason}" if reason else status,
-                        LAST_TRAY_COUNT,
-                        attempt=RECLICK_ATTEMPTS + 1,
-                        feedback="local_fallback",
-                    )
                 else:
                     print(
                         "[兜底] 最高优先级组中没有可点击的坐标，"
@@ -4212,10 +3567,6 @@ def main():
             gc.collect()
             time.sleep(2)
 
-    # 【收尾兜底】不论从哪条路跳出循环（Ctrl+C / 鼠标安全机制 /
-    # SystemExit / 各类停机），都把当前局的轨迹抢救下来：
-    # 正常打完的局在 finish_level 里已经存过，这里会自动空转。
-    finalize_interrupted_episode()
 
 # ============================================================
 # 13. 程序入口

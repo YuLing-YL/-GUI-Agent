@@ -147,7 +147,14 @@ def missing_dependencies():
 def make_client(base_url, api_key, timeout):
     """按 OpenAI 兼容协议建一个客户端。"""
 
-    from openai import OpenAI
+    try:
+        from openai import OpenAI
+    except ModuleNotFoundError:
+        raise RuntimeError(
+            "当前 Python 没装 openai 库。"
+            "请在终端执行：pip install -r requirements.txt，"
+            "然后换一个装好依赖的 Python 重新打开本启动器。"
+        )
 
     return OpenAI(
         base_url=base_url,
@@ -397,11 +404,13 @@ class LauncherApp:
 
         if self._missing:
             names = "、".join(package for _, package in self._missing)
+            self.btn_test.state(["disabled"])
             self.btn_start.state(["disabled"])
             self.var_status.set(
                 f"缺少依赖：{names}。\n"
                 f"先在终端执行：pip install -r requirements.txt\n"
-                f"（或 pip install {names}）再重新打开本窗口。"
+                f"（或 pip install {names}），"
+                f"再用装好依赖的 Python 重新打开本窗口。"
             )
         else:
             self.var_status.set("填写上面的信息，建议先点「测试连接」确认可用。")
@@ -454,10 +463,17 @@ class LauncherApp:
 
     def _set_busy(self, busy):
         state = ["disabled"] if busy else ["!disabled"]
-        self.btn_test.state(state)
 
-        if not self._missing:
-            self.btn_start.state(state)
+        # 缺依赖时两个按钮都不能点：
+        # 「开始运行」跑不起来，「测试连接」也只会报 import 错误
+        if self._missing:
+            self.btn_test.state(["disabled"])
+            self.btn_start.state(["disabled"])
+
+            return
+
+        self.btn_test.state(state)
+        self.btn_start.state(state)
 
     def on_test(self):
         cfg = self._collect()
