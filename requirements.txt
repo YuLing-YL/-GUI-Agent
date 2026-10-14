@@ -1,0 +1,14 @@
+# 《羊了个羊》GUI Agent —— 运行依赖（macOS）
+#
+# 以下为本项目实测可用的版本组合（Python 3.11.17）。
+# 只「玩游戏」不需要任何训练框架（torch / transformers / trl / peft 一概不用）。
+#
+# 安装：
+#   python3.11 -m venv .venv && source .venv/bin/activate
+#   pip install -r requirements.txt
+
+pyautogui==0.9.54                  # 截屏 + 模拟鼠标点击
+Pillow==12.3.0                     # 图像裁剪 / 缩放 / 存 JPEG（pyautogui 也依赖它）
+openai==3.29.0                     # 调用 LM Studio 提供的 OpenAI 兼容接口
+pyobjc-framework-Quartz==12.2.2    # 枚举 macOS 窗口以定位游戏窗口
+                                   # （会连带安装 pyobjc-core、pyobjc-framework-Cocoa）
